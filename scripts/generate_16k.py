@@ -10,9 +10,11 @@ Usage:
   PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 uv run python scripts/generate_16k.py
 """
 
+import os
+import argparse
+
 import torch
 import numpy as np
-import os
 
 from PIL import Image
 from generation.decode_utils import reconstruct_from_channelwise_indices, denorm_to_uint8
@@ -21,20 +23,8 @@ from generation.models.gpt import GPT_models
 from utils.checkpoint import load_config as load_decoder_config
 
 
-# ---- Config ----
-CKPT_PATH = "llamagen_flextok/results_imagenet100k_16k/000-GPT-B/checkpoints/latest.pt"
-DECODER_CKPT = "checkpoints/imagenet100k_16k_tokenizer/checkpoints/best.ckpt"
-DECODER_CONFIG = "configs/num_channels/ch_256_16k"
-LATENTS_PATH = "latents_data/imagenet100k_16k/val_latents.npz"
-OUTPUT_DIR = "temp_output/16k_generation_final"
-
-NUM_UNCOND = 30          # unconditional images
-NUM_COMPLETION = 5       # images per completion ratio
 COMPLETION_RATIOS = [0.10, 0.20, 0.25, 0.50]  # 10%, 20%, 25%, 50%
-TEMPERATURE = 0.85
-TOP_K = 200
 TOTAL_TOKENS = 256
-DEVICE = "cuda"
 
 
 def load_gpt(ckpt_path, device):
@@ -42,7 +32,8 @@ def load_gpt(ckpt_path, device):
     args = ckpt['args']
     print(f"Checkpoint: epoch={ckpt['epoch']}, step={ckpt['steps']}")
 
-    gpt = GPT_models['GPT-B'](
+    model_name = getattr(args, 'gpt_model', 'GPT-B')
+    gpt = GPT_models[model_name](
         vocab_size=args.pad_token_id + 1,
         block_size=args.max_sequence_length,
         num_classes=1000, cls_token_num=0, model_type='c2i',
@@ -52,7 +43,7 @@ def load_gpt(ckpt_path, device):
     sd = {k.replace('_orig_mod.', ''): v for k, v in ckpt['model'].items()}
     gpt.load_state_dict(sd, strict=True)
     gpt.eval().to(device)
-    print(f"GPT-B loaded: {sum(p.numel() for p in gpt.parameters())/1e6:.1f}M params")
+    print(f"{model_name} loaded: {sum(p.numel() for p in gpt.parameters())/1e6:.1f}M params")
     return gpt, args
 
 
@@ -84,13 +75,26 @@ def decode_tokens(decoder, token_ids, device):
 
 
 def main():
-    os.makedirs(f"{OUTPUT_DIR}/unconditional", exist_ok=True)
-    os.makedirs(f"{OUTPUT_DIR}/completion", exist_ok=True)
+    parser = argparse.ArgumentParser(description="Generate and complete ImageNet-100 images")
+    parser.add_argument("--gpt-ckpt", required=True)
+    parser.add_argument("--decoder-ckpt", required=True)
+    parser.add_argument("--decoder-config", required=True)
+    parser.add_argument("--val-latents", required=True)
+    parser.add_argument("--output-dir", default="temp_output/16k_generation_final")
+    parser.add_argument("--num-unconditional", type=int, default=30)
+    parser.add_argument("--num-completion", type=int, default=5)
+    parser.add_argument("--temperature", type=float, default=0.85)
+    parser.add_argument("--top-k", type=int, default=200)
+    parser.add_argument("--device", default="cuda")
+    cli = parser.parse_args()
+
+    os.makedirs(f"{cli.output_dir}/unconditional", exist_ok=True)
+    os.makedirs(f"{cli.output_dir}/completion", exist_ok=True)
 
     # Load models
-    gpt, args = load_gpt(CKPT_PATH, DEVICE)
-    decoder_cfg = load_decoder_config(DECODER_CONFIG)
-    decoder = load_decoder_model(DECODER_CKPT, decoder_cfg, DEVICE)
+    gpt, args = load_gpt(cli.gpt_ckpt, cli.device)
+    decoder_cfg = load_decoder_config(cli.decoder_config)
+    decoder = load_decoder_model(cli.decoder_ckpt, decoder_cfg, cli.device)
     print("Decoder loaded")
 
     bos_id = args.bos_token_id
@@ -98,17 +102,17 @@ def main():
 
     # ---- Part 1: Unconditional Generation ----
     print(f"\n{'='*60}")
-    print(f"Generating {NUM_UNCOND} unconditional images (full 256 tokens)")
+    print(f"Generating {cli.num_unconditional} unconditional images (full 256 tokens)")
     print(f"{'='*60}")
 
-    for i in range(NUM_UNCOND):
+    for i in range(cli.num_unconditional):
         torch.manual_seed(200 + i)
-        tokens = sample_tokens(gpt, [bos_id], TOTAL_TOKENS, vocab, DEVICE,
-                               TEMPERATURE, TOP_K)
-        img = decode_tokens(decoder, tokens[1:], DEVICE)  # skip BOS
-        Image.fromarray(img).save(f"{OUTPUT_DIR}/unconditional/gen_{i:02d}.png")
+        tokens = sample_tokens(gpt, [bos_id], TOTAL_TOKENS, vocab, cli.device,
+                               cli.temperature, cli.top_k)
+        img = decode_tokens(decoder, tokens[1:], cli.device)  # skip BOS
+        Image.fromarray(img).save(f"{cli.output_dir}/unconditional/gen_{i:02d}.png")
         if (i + 1) % 5 == 0:
-            print(f"  {i+1}/{NUM_UNCOND}")
+            print(f"  {i+1}/{cli.num_unconditional}")
 
     # ---- Part 2: Completion from real tokens ----
     print(f"\n{'='*60}")
@@ -116,19 +120,19 @@ def main():
     print(f"{'='*60}")
 
     # Load real val latents
-    data = np.load(LATENTS_PATH)
+    data = np.load(cli.val_latents)
     val_indices = data['indices']  # [5000, 256]
 
     for ratio in COMPLETION_RATIOS:
         n_given = int(TOTAL_TOKENS * ratio)
         n_generate = TOTAL_TOKENS - n_given
         ratio_name = f"{int(ratio*100)}pct"
-        ratio_dir = f"{OUTPUT_DIR}/completion/{ratio_name}"
+        ratio_dir = f"{cli.output_dir}/completion/{ratio_name}"
         os.makedirs(ratio_dir, exist_ok=True)
 
         print(f"\n  Ratio {ratio_name}: {n_given} given + {n_generate} generated = 256 tokens")
 
-        for i in range(NUM_COMPLETION):
+        for i in range(cli.num_completion):
             # Pick a val image (spread across dataset)
             img_idx = i * 200
             real_tokens = val_indices[img_idx].tolist()
@@ -137,19 +141,19 @@ def main():
 
             # Prefix: BOS + first n_given real tokens
             prefix = [bos_id] + real_tokens[:n_given]
-            tokens = sample_tokens(gpt, prefix, n_generate, vocab, DEVICE,
-                                   TEMPERATURE, TOP_K)
+            tokens = sample_tokens(gpt, prefix, n_generate, vocab, cli.device,
+                                   cli.temperature, cli.top_k)
             generated_tokens = tokens[1:]  # skip BOS
 
             # Also decode the full real image for comparison
-            real_img = decode_tokens(decoder, real_tokens, DEVICE)
+            real_img = decode_tokens(decoder, real_tokens, cli.device)
 
             # Decode the completion (given real prefix + generated rest)
-            completed_img = decode_tokens(decoder, generated_tokens, DEVICE)
+            completed_img = decode_tokens(decoder, generated_tokens, cli.device)
 
             # Decode just the prefix (padded with zeros for missing channels)
             prefix_only = real_tokens[:n_given]
-            prefix_img = decode_tokens(decoder, prefix_only, DEVICE)
+            prefix_img = decode_tokens(decoder, prefix_only, cli.device)
 
             # Save: real | prefix_only | completed
             combined = np.concatenate([real_img, prefix_img, completed_img], axis=1)
@@ -161,9 +165,9 @@ def main():
         print(f"  Saved to {ratio_dir}/")
 
     print(f"\n{'='*60}")
-    print(f"Done! All images at {OUTPUT_DIR}/")
-    print(f"  unconditional/  - {NUM_UNCOND} images from scratch")
-    print(f"  completion/     - {NUM_COMPLETION} images per ratio")
+    print(f"Done! All images at {cli.output_dir}/")
+    print(f"  unconditional/  - {cli.num_unconditional} images from scratch")
+    print(f"  completion/     - {cli.num_completion} images per ratio")
     print(f"    10pct/ - given 26 tokens, generated 230")
     print(f"    20pct/ - given 51 tokens, generated 205")
     print(f"    25pct/ - given 64 tokens, generated 192")
